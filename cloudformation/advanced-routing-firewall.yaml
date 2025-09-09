@@ -1,7 +1,7 @@
 AWSTemplateFormatVersion: '2010-09-09'
 Description: >
   Advanced Routing Lab — VPC with Public, DMZ, Private subnets; EC2 firewall/router with 2 ENIs,
-  SourceDestCheck disabled; Private RT default via FW ENI; simple HTTP app in Private.
+  SourceDestCheck disabled; Private RT default via FW; simple HTTP app in Private.
 
 Parameters:
   KeyName:
@@ -15,12 +15,11 @@ Parameters:
     Type: String
     Default: t3.micro
     AllowedValues: [t2.micro, t3.micro, t3a.micro]
-
-Resources:
   AmiAL2023:
     Type: 'AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>'
     Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-6.1-x86_64
 
+Resources:
   VPC:
     Type: AWS::EC2::VPC
     Properties:
@@ -31,6 +30,7 @@ Resources:
 
   Igw:
     Type: AWS::EC2::InternetGateway
+
   AttachIgw:
     Type: AWS::EC2::VPCGatewayAttachment
     Properties:
@@ -67,11 +67,14 @@ Resources:
   RtPublic:
     Type: AWS::EC2::RouteTable
     Properties: { VpcId: !Ref VPC }
+
   AssocPub:
     Type: AWS::EC2::SubnetRouteTableAssociation
     Properties: { SubnetId: !Ref SubnetPublic, RouteTableId: !Ref RtPublic }
+
   RtPubDefault:
     Type: AWS::EC2::Route
+    DependsOn: AttachIgw
     Properties:
       RouteTableId: !Ref RtPublic
       DestinationCidrBlock: 0.0.0.0/0
@@ -80,11 +83,14 @@ Resources:
   RtDMZ:
     Type: AWS::EC2::RouteTable
     Properties: { VpcId: !Ref VPC }
+
   AssocDMZ:
     Type: AWS::EC2::SubnetRouteTableAssociation
     Properties: { SubnetId: !Ref SubnetDMZ, RouteTableId: !Ref RtDMZ }
+
   RtDMZDefault:
     Type: AWS::EC2::Route
+    DependsOn: AttachIgw
     Properties:
       RouteTableId: !Ref RtDMZ
       DestinationCidrBlock: 0.0.0.0/0
@@ -93,6 +99,7 @@ Resources:
   RtPrivate:
     Type: AWS::EC2::RouteTable
     Properties: { VpcId: !Ref VPC }
+
   AssocPrivate:
     Type: AWS::EC2::SubnetRouteTableAssociation
     Properties: { SubnetId: !Ref SubnetPrivate, RouteTableId: !Ref RtPrivate }
@@ -167,6 +174,7 @@ Resources:
       ImageId: !Ref AmiAL2023
       InstanceType: !Ref InstanceType
       KeyName: !Ref KeyName
+      SourceDestCheck: false
       NetworkInterfaces:
         - DeviceIndex: 0
           NetworkInterfaceId: !Ref FirewallENI_DMZ
@@ -184,8 +192,7 @@ Resources:
           # Install tools
           dnf -y install iptables-services tcpdump
 
-          # Map interfaces (eth0=DMZ, eth1=Private on AL2023 by default)
-          # NAT out of DMZ (eth0)
+          # NAT out of DMZ (eth0) and allow forwarding from private (eth1)
           iptables -t nat -A POSTROUTING -o eth0 -j MASQUERADE
           iptables -A FORWARD -i eth1 -o eth0 -j ACCEPT
           iptables -A FORWARD -m state --state ESTABLISHED,RELATED -j ACCEPT
@@ -199,36 +206,6 @@ Resources:
     Properties:
       AllocationId: !GetAtt EipFirewall.AllocationId
       NetworkInterfaceId: !Ref FirewallENI_DMZ
-
-  DisableSrcDstCheck:
-    Type: AWS::EC2::NetworkInterfaceAttachment
-    Properties:
-      DeviceIndex: 0
-      InstanceId: !Ref Firewall
-      NetworkInterfaceId: !Ref FirewallENI_DMZ
-    DependsOn: Firewall
-  # Note: CloudFormation lacks a direct resource to disable SourceDestCheck per ENI;
-  # use AWS::EC2::Instance with SourceDestCheck=false — but not supported. We use a custom command after launch:
-  DisableSrcDstCfnInit:
-    Type: AWS::EC2::Instance
-    Properties:
-      ImageId: !Ref AmiAL2023
-      InstanceType: t3.micro
-      SubnetId: !Ref SubnetPublic
-      SecurityGroupIds: [ !Ref SgBastion ]
-      Tags: [{ Key: Name, Value: temp-disable-srcdst-helper }]
-      UserData:
-        Fn::Base64: !Sub |
-          #!/bin/bash
-          set -eux
-          # Disable source/dest check on both FW ENIs via IMDSv2 + AWS CLI (install quickly)
-          dnf -y install awscli
-          TOKEN=$(curl -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 21600")
-          REGION=$(curl -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/dynamic/instance-identity/document | jq -r .region || echo "us-east-1")
-          aws ec2 modify-network-interface-attribute --no-source-dest-check --network-interface-id ${FirewallENI_DMZ} --region $REGION || true
-          aws ec2 modify-network-interface-attribute --no-source-dest-check --network-interface-id ${FirewallENI_Private} --region $REGION || true
-          shutdown -h now
-    DependsOn: Firewall
 
   # ---------- App instance (private) ----------
   App:
@@ -248,13 +225,14 @@ Resources:
           echo "<h1>Lab5 App (10.70.3.0/24)</h1>" > /var/www/html/index.html
           systemctl enable --now httpd
 
-  # Route private default to FW (via private ENI)
+  # Route private default to FW (NAT instance)
   RtPrivateDefaultToFW:
     Type: AWS::EC2::Route
+    DependsOn: Firewall
     Properties:
       RouteTableId: !Ref RtPrivate
       DestinationCidrBlock: 0.0.0.0/0
-      NetworkInterfaceId: !Ref FirewallENI_Private
+      InstanceId: !Ref Firewall
 
 Outputs:
   BastionPublicIP:
