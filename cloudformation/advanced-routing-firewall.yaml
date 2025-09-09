@@ -1,0 +1,268 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Advanced Routing Lab — VPC with Public, DMZ, Private subnets; EC2 firewall/router with 2 ENIs,
+  SourceDestCheck disabled; Private RT default via FW ENI; simple HTTP app in Private.
+
+Parameters:
+  KeyName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Description: EC2 KeyPair name for SSH
+  YourIpCidr:
+    Type: String
+    Description: Your IP in CIDR form for SSH to bastion/firewall (e.g., 203.0.113.10/32)
+    Default: 0.0.0.0/0
+  InstanceType:
+    Type: String
+    Default: t3.micro
+    AllowedValues: [t2.micro, t3.micro, t3a.micro]
+
+Resources:
+  AmiAL2023:
+    Type: 'AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>'
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-6.1-x86_64
+
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.70.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags: [{ Key: Name, Value: lab5-vpc }]
+
+  Igw:
+    Type: AWS::EC2::InternetGateway
+  AttachIgw:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref Igw
+
+  SubnetPublic:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.70.1.0/24
+      MapPublicIpOnLaunch: true
+      AvailabilityZone: !Select [0, !GetAZs '']
+      Tags: [{ Key: Name, Value: lab5-public }]
+
+  SubnetDMZ:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.70.2.0/24
+      MapPublicIpOnLaunch: true
+      AvailabilityZone: !Select [0, !GetAZs '']
+      Tags: [{ Key: Name, Value: lab5-dmz }]
+
+  SubnetPrivate:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.70.3.0/24
+      MapPublicIpOnLaunch: false
+      AvailabilityZone: !Select [0, !GetAZs '']
+      Tags: [{ Key: Name, Value: lab5-private }]
+
+  RtPublic:
+    Type: AWS::EC2::RouteTable
+    Properties: { VpcId: !Ref VPC }
+  AssocPub:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { SubnetId: !Ref SubnetPublic, RouteTableId: !Ref RtPublic }
+  RtPubDefault:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref RtPublic
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref Igw
+
+  RtDMZ:
+    Type: AWS::EC2::RouteTable
+    Properties: { VpcId: !Ref VPC }
+  AssocDMZ:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { SubnetId: !Ref SubnetDMZ, RouteTableId: !Ref RtDMZ }
+  RtDMZDefault:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref RtDMZ
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref Igw
+
+  RtPrivate:
+    Type: AWS::EC2::RouteTable
+    Properties: { VpcId: !Ref VPC }
+  AssocPrivate:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { SubnetId: !Ref SubnetPrivate, RouteTableId: !Ref RtPrivate }
+
+  SgBastion:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Bastion SG — SSH from YourIpCidr
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - { IpProtocol: tcp, FromPort: 22, ToPort: 22, CidrIp: !Ref YourIpCidr }
+      SecurityGroupEgress:
+        - { IpProtocol: -1, CidrIp: 0.0.0.0/0 }
+
+  SgFirewall:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Firewall SG — SSH from YourIpCidr; allow VPC transit
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - { IpProtocol: tcp, FromPort: 22, ToPort: 22, CidrIp: !Ref YourIpCidr }
+        - { IpProtocol: -1, CidrIp: 10.70.0.0/16 }
+      SecurityGroupEgress:
+        - { IpProtocol: -1, CidrIp: 0.0.0.0/0 }
+
+  SgApp:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: App SG — HTTP from VPC; SSH from Bastion/Firewall
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - { IpProtocol: tcp, FromPort: 80, ToPort: 80, CidrIp: 10.70.0.0/16 }
+        - { IpProtocol: tcp, FromPort: 22, ToPort: 22, SourceSecurityGroupId: !Ref SgBastion }
+        - { IpProtocol: tcp, FromPort: 22, ToPort: 22, SourceSecurityGroupId: !Ref SgFirewall }
+      SecurityGroupEgress:
+        - { IpProtocol: -1, CidrIp: 0.0.0.0/0 }
+
+  Bastion:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Ref AmiAL2023
+      InstanceType: !Ref InstanceType
+      KeyName: !Ref KeyName
+      SubnetId: !Ref SubnetPublic
+      SecurityGroupIds: [ !Ref SgBastion ]
+      Tags: [{ Key: Name, Value: lab5-bastion }]
+
+  # ---------- Firewall instance with two ENIs ----------
+  EipFirewall:
+    Type: AWS::EC2::EIP
+    Properties: { Domain: vpc }
+
+  FirewallENI_DMZ:
+    Type: AWS::EC2::NetworkInterface
+    Properties:
+      SubnetId: !Ref SubnetDMZ
+      Description: Firewall DMZ (public) interface
+      GroupSet: [ !Ref SgFirewall ]
+      Tags: [{ Key: Name, Value: lab5-fw-eni-dmz }]
+
+  FirewallENI_Private:
+    Type: AWS::EC2::NetworkInterface
+    Properties:
+      SubnetId: !Ref SubnetPrivate
+      Description: Firewall private interface
+      GroupSet: [ !Ref SgFirewall ]
+      Tags: [{ Key: Name, Value: lab5-fw-eni-private }]
+
+  Firewall:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Ref AmiAL2023
+      InstanceType: !Ref InstanceType
+      KeyName: !Ref KeyName
+      NetworkInterfaces:
+        - DeviceIndex: 0
+          NetworkInterfaceId: !Ref FirewallENI_DMZ
+        - DeviceIndex: 1
+          NetworkInterfaceId: !Ref FirewallENI_Private
+      Tags: [{ Key: Name, Value: lab5-firewall }]
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          set -eux
+          # Enable IP forwarding
+          sysctl -w net.ipv4.ip_forward=1
+          sed -i 's/^#\?net.ipv4.ip_forward=.*/net.ipv4.ip_forward=1/' /etc/sysctl.conf
+
+          # Install tools
+          dnf -y install iptables-services tcpdump
+
+          # Map interfaces (eth0=DMZ, eth1=Private on AL2023 by default)
+          # NAT out of DMZ (eth0)
+          iptables -t nat -A POSTROUTING -o eth0 -j MASQUERADE
+          iptables -A FORWARD -i eth1 -o eth0 -j ACCEPT
+          iptables -A FORWARD -m state --state ESTABLISHED,RELATED -j ACCEPT
+
+          # Persist rules
+          service iptables save || /usr/libexec/iptables/iptables.init save || true
+          systemctl enable --now iptables
+
+  EipAssocFirewall:
+    Type: AWS::EC2::EIPAssociation
+    Properties:
+      AllocationId: !GetAtt EipFirewall.AllocationId
+      NetworkInterfaceId: !Ref FirewallENI_DMZ
+
+  DisableSrcDstCheck:
+    Type: AWS::EC2::NetworkInterfaceAttachment
+    Properties:
+      DeviceIndex: 0
+      InstanceId: !Ref Firewall
+      NetworkInterfaceId: !Ref FirewallENI_DMZ
+    DependsOn: Firewall
+  # Note: CloudFormation lacks a direct resource to disable SourceDestCheck per ENI;
+  # use AWS::EC2::Instance with SourceDestCheck=false — but not supported. We use a custom command after launch:
+  DisableSrcDstCfnInit:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Ref AmiAL2023
+      InstanceType: t3.micro
+      SubnetId: !Ref SubnetPublic
+      SecurityGroupIds: [ !Ref SgBastion ]
+      Tags: [{ Key: Name, Value: temp-disable-srcdst-helper }]
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          set -eux
+          # Disable source/dest check on both FW ENIs via IMDSv2 + AWS CLI (install quickly)
+          dnf -y install awscli
+          TOKEN=$(curl -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 21600")
+          REGION=$(curl -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/dynamic/instance-identity/document | jq -r .region || echo "us-east-1")
+          aws ec2 modify-network-interface-attribute --no-source-dest-check --network-interface-id ${FirewallENI_DMZ} --region $REGION || true
+          aws ec2 modify-network-interface-attribute --no-source-dest-check --network-interface-id ${FirewallENI_Private} --region $REGION || true
+          shutdown -h now
+    DependsOn: Firewall
+
+  # ---------- App instance (private) ----------
+  App:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Ref AmiAL2023
+      InstanceType: !Ref InstanceType
+      KeyName: !Ref KeyName
+      SubnetId: !Ref SubnetPrivate
+      SecurityGroupIds: [ !Ref SgApp ]
+      Tags: [{ Key: Name, Value: lab5-app }]
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          set -eux
+          dnf -y install httpd curl
+          echo "<h1>Lab5 App (10.70.3.0/24)</h1>" > /var/www/html/index.html
+          systemctl enable --now httpd
+
+  # Route private default to FW (via private ENI)
+  RtPrivateDefaultToFW:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref RtPrivate
+      DestinationCidrBlock: 0.0.0.0/0
+      NetworkInterfaceId: !Ref FirewallENI_Private
+
+Outputs:
+  BastionPublicIP:
+    Value: !GetAtt Bastion.PublicIp
+    Description: Public IP of bastion host
+  FirewallPublicIP:
+    Value: !GetAtt EipFirewall.PublicIp
+    Description: Public IP of firewall (DMZ)
+  AppPrivateIP:
+    Value: !GetAtt App.PrivateIp
+    Description: Private App EC2 IP
